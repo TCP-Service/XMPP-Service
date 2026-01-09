@@ -199,6 +199,16 @@ class SecureTCPServer {
 
         const to = presence['@_to'];
 
+        const presencePayload = {
+            'presence': {
+                '@_from': socket.fullJid,
+                ...(presence.show ? { show: presence.show } : {}),
+                ...(presence.status ? { status: presence.status } : {})
+            }
+        };
+
+        const xml = builder.build(presencePayload);
+
         if (to && to.includes('@') && to.split('@')[1].startsWith(this.mucDomain)) {
             const room = to.split('/')[0];
             const nick = to.split('/')[1] || socket.username;
@@ -219,7 +229,17 @@ class SecureTCPServer {
                 }
             }));
 
-            this.log_debug(`MUC JOIN ${nick} -> ${room}`);
+            for (const client of occupants.values()) {
+                if (client !== socket) client.write(builder.build({
+                    'presence': {
+                        '@_from': `${room}/${nick}`,
+                        ...(presence.show ? { show: presence.show } : {}),
+                        ...(presence.status ? { status: presence.status } : {})
+                    }
+                }));
+            }
+
+            this.log_debug(`MUC PRESENCE ${nick} -> ${room}`);
             return;
         }
 
@@ -230,14 +250,8 @@ class SecureTCPServer {
 
         this.online.set(socket.fullJid, socket);
 
-        const stanza = builder.build({
-            'presence': {
-                '@_from': socket.fullJid
-            }
-        });
-
         for (const client of this.online.values()) {
-            if (client !== socket) client.write(stanza);
+            if (client !== socket) client.write(xml);
         }
 
         this.log_debug(`PRESENCE ${socket.username} (${socket.fullJid})`);
@@ -248,10 +262,14 @@ class SecureTCPServer {
 
         this.online.delete(socket.fullJid);
 
-        if (socket.currentRoom && this.mucRooms.has(socket.currentRoom)) {
+        if (socket.currentRoom) {
             const room = this.mucRooms.get(socket.currentRoom);
-            room.delete(socket.fullJid);
-            this.log_debug(`MUC LEAVE ${socket.username} -> ${socket.currentRoom}`);
+            if (room) {
+                room.delete(socket.fullJid);
+                if (room.size === 0) this.mucRooms.delete(socket.currentRoom);
+            }
+            socket.currentRoom = null;
+            socket.roomNick = null;
         }
 
         const stanza = builder.build({
@@ -266,8 +284,6 @@ class SecureTCPServer {
                 client.write(stanza);
             }
         }
-
-        this.log_debug(`UNAVAILABLE ${socket.username} (${socket.fullJid})`);
     }
 
     handleMessage(socket, message) {
