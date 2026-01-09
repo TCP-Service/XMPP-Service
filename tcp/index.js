@@ -4,6 +4,7 @@ import crypto from 'crypto';
 import net from 'net';
 import xmpp_config from '../cfg/xmpp_config.js';
 import logging from '../utilities/log.js';
+import { XMLBuilder, XMLParser } from 'fast-xml-parser';
 
 const options = {
     port: xmpp_config.server.port,
@@ -11,6 +12,17 @@ const options = {
     cert: xmpp_config.certs.cert,
     cert_bundle: xmpp_config.certs.ca_bundle
 }
+
+const parser = new XMLParser({
+    ignoreAttributes: false,
+    attributeNamePrefix: ""
+});
+
+const builder = new XMLBuilder({
+    ignoreAttributes: false,
+    attributeNamePrefix: "",
+    suppressEmptyNode: true
+});
 
 class SecureTCPServer {
     constructor(options = {}) {
@@ -114,8 +126,7 @@ version='1.0'>`);
             this.sendStream(tlsSocket, true);
             return;
         }
-
-        if (msg.includes('<auth')) {
+        else if (msg.includes('<auth')) {
             const creds = this.parseSASLPlain(msg.match(/>([^<]+)</)?.[1] || '');
             if (this.authenticateClient(creds.username, creds.password)) {
                 socket.username = creds.username;
@@ -126,13 +137,11 @@ version='1.0'>`);
             }
             return;
         }
-
-        if (msg.includes('<stream:stream') && socket.authenticated) {
+        else if (msg.includes('<stream:stream') && socket.authenticated) {
             this.sendStream(socket, true);
             return;
         }
-
-        if (msg.includes('<iq') && msg.includes('bind')) {
+        else if (msg.includes('<iq') && msg.includes('bind')) {
             const id = msg.match(/id=['"]([^'"]+)['"]/)?.[1];
             socket.write(`<iq type='result' id='${id}'>
 <bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'>
@@ -141,20 +150,17 @@ version='1.0'>`);
 </iq>`);
             return;
         }
-
-        if (msg.includes('<iq') && msg.includes('session')) {
+        else if (msg.includes('<iq') && msg.includes('session')) {
             const id = msg.match(/id=['"]([^'"]+)['"]/)?.[1];
             socket.write(`<iq type='result' id='${id}'/>`);
             return;
         }
-
-        if (msg.includes("<presence") && msg.includes("type='subscribe'")) {
+        else if (msg.includes("<presence") && msg.includes("type='subscribe'")) {
             const to = msg.match(/to=['"]([^'"]+)['"]/)?.[1];
             socket.write(`<presence to='${to}' from='${socket.fullJid}' type='subscribed'/>`);
             return;
         }
-
-        if (msg.includes('<presence') && msg.includes(this.roomJid)) {
+        else if (msg.includes('<presence') && msg.includes(this.roomJid)) {
             const nick = msg.match(/\/([^'"]+)/)?.[1] || socket.username;
             socket.mucNick = nick;
             this.mucRoom.set(nick, socket);
@@ -166,8 +172,7 @@ version='1.0'>`);
             this.log_debug(`MUC JOIN ${nick}`);
             return;
         }
-
-        if (msg.includes('<presence')) {
+        else if (msg.includes('<presence')) {
             const p = msg.includes('from=')
                 ? msg
                 : msg.replace('<presence', `<presence from='${socket.fullJid}'`);
@@ -178,8 +183,7 @@ version='1.0'>`);
             this.log_debug(`PRESENCE ${socket.username}`);
             return;
         }
-
-        if (msg.includes('<message') && msg.includes(this.roomJid)) {
+        else if (msg.includes('<message') && msg.includes(this.roomJid)) {
             const body = msg.match(/<body>([^<]+)<\/body>/)?.[1];
             if (!body) return;
 
@@ -192,8 +196,7 @@ from='${this.roomJid}/${socket.mucNick}'>
             this.log_debug(`MUC MSG ${socket.mucNick}: ${body}`);
             return;
         }
-
-        if (msg.includes('<message')) {
+        else if (msg.includes('<message')) {
             const to = msg.match(/to=['"]([^'"]+)['"]/)?.[1];
             const body = msg.match(/<body>([^<]+)<\/body>/)?.[1];
             if (!to || !body) return;
@@ -206,6 +209,22 @@ from='${this.roomJid}/${socket.mucNick}'>
                 }
             }
             this.log_debug(`MSG ${socket.username} -> ${to}`);
+        }
+        else if (msg.includes('<ping:ping')) {
+            this.log_debug('PING received from client.');
+
+            const obj = parser.parse(msg);
+            const id = obj.iq.id;
+
+            socket.write(builder.build({
+                id: {
+                    type: 'result',
+                    id: id
+                }
+            }))
+        }
+        else {
+            this.log_debug(`Unknown message received from client. ${msg}`);
         }
     }
 
