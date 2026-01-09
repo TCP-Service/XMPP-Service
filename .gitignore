@@ -1,0 +1,3 @@
+cfg/certificate/ca_bundle.crt
+cfg/certificate/certificate.crt
+cfg/certificate/private.key
