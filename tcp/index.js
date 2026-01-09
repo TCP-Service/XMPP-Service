@@ -136,7 +136,6 @@ class SecureTCPServer {
 
         const stanzas = this.parseStanza(msg);
         for (const stanza of stanzas) {
-            console.log(stanza.type)
             if (stanza.type === 'iq') this.handleIQ(socket, stanza.data);
             else if (stanza.type === 'presence') this.handlePresence(socket, stanza.data);
             else if (stanza.type === 'message') this.handleMessage(socket, stanza.data);
@@ -206,7 +205,7 @@ class SecureTCPServer {
         const toBase = to.split('/')[0];
         for (const [fullJid, pres] of this.presences.entries()) {
             if (fullJid.startsWith(toBase)) {
-                pres.socket.write(builder.build({ 'message': { '@_from': socket.fullJid, '@_to': fullJid, 'body': body } }));
+                pres.socket.write(builder.build({ 'message': { '@_from': socket.fullJid, '@_to': fullJid, 'body': body, '@_type': message['@_type'] } }));
             }
         }
 
