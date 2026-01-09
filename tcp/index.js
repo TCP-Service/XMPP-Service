@@ -25,18 +25,26 @@ class SecureTCPServer {
     constructor(options = {}) {
         this.port = xmpp_config.server.port || 5222;
         this.host = xmpp_config.server.ip || '0.0.0.0';
+        this.domain = xmpp_config.host.domain;
+        this.mucDomain = `${xmpp_config.options.muc_name}.${this.domain}`;
+        this.globalRoom = `${xmpp_config.options.global_chat_name}@${this.mucDomain}`;
+
         this.tlsOptions = {
-            key: fs.readFileSync(options.key || 'cfg/certificate/private.key'),
-            cert: fs.readFileSync(options.cert || 'cfg/certificate/certificate.crt'),
-            ca: fs.readFileSync(options.ca_cert || 'cfg/certificate/ca_bundle.crt'),
+            key: fs.readFileSync(xmpp_config.certs.key),
+            cert: fs.readFileSync(xmpp_config.certs.cert),
+            ca: fs.readFileSync(xmpp_config.certs.ca_bundle),
             rejectUnauthorized: false,
             secureProtocol: 'TLS_method'
         };
-        this.domain = xmpp_config.host.domain;
+
         this.server = null;
         this.clients = new Map();
-        this.presences = new Map();
+        this.online = new Map();
+        this.mucOccupants = new Map();
     }
+
+    log(msg) { logging.xmpp(`${msg}`); }
+    log_debug(msg) { if (xmpp_config.log_debug) logging.debug(`${msg}`); }
 
     start() {
         this.server = net.createServer(socket => {
@@ -54,9 +62,6 @@ class SecureTCPServer {
         );
     }
 
-    log(msg) { logging.xmpp(`${msg}`); }
-    log_debug(msg) { if (xmpp_config.log_debug) logging.debug(`${msg}`); }
-
     authenticateClient(username, password) {
         this.log_debug(`AUTH attempt ${username}`);
         return true;
@@ -68,7 +73,7 @@ class SecureTCPServer {
     }
 
     sendStream(socket, encrypted = false) {
-        const streamOpen = builder.build({
+        const open = builder.build({
             '?xml': { '@_version': '1.0' },
             'stream:stream': {
                 '@_xmlns': 'jabber:client',
@@ -79,28 +84,49 @@ class SecureTCPServer {
             }
         });
 
-        socket.write(streamOpen.replace('/>', '>'));
+        socket.write(open.replace('/>', '>'));
 
         if (!encrypted) {
-            socket.write(builder.build({ 'stream:features': { 'starttls': { '@_xmlns': 'urn:ietf:params:xml:ns:xmpp-tls', 'required': '' } } }));
+            socket.write(builder.build({
+                'stream:features': {
+                    'starttls': {
+                        '@_xmlns': 'urn:ietf:params:xml:ns:xmpp-tls',
+                        'required': ''
+                    }
+                }
+            }));
         } else if (!socket.authenticated) {
-            socket.write(builder.build({ 'stream:features': { 'mechanisms': { '@_xmlns': 'urn:ietf:params:xml:ns:xmpp-sasl', 'mechanism': 'PLAIN' } } }));
+            socket.write(builder.build({
+                'stream:features': {
+                    'mechanisms': {
+                        '@_xmlns': 'urn:ietf:params:xml:ns:xmpp-sasl',
+                        'mechanism': 'PLAIN'
+                    }
+                }
+            }));
         } else {
-            socket.write(builder.build({ 'stream:features': { 'bind': { '@_xmlns': 'urn:ietf:params:xml:ns:xmpp-bind' }, 'session': { '@_xmlns': 'urn:ietf:params:xml:ns:xmpp-session' } } }));
+            socket.write(builder.build({
+                'stream:features': {
+                    'bind': { '@_xmlns': 'urn:ietf:params:xml:ns:xmpp-bind' },
+                    'session': { '@_xmlns': 'urn:ietf:params:xml:ns:xmpp-session' }
+                }
+            }));
         }
     }
 
     parseStanza(msg) {
         try {
-            const stanzas = [];
             const wrapped = `<root>${msg}</root>`;
             const parsed = parser.parse(wrapped);
+            const out = [];
             if (parsed.root) {
-                for (const [key, value] of Object.entries(parsed.root)) {
-                    if (key !== '?xml' && key !== 'stream:stream') stanzas.push({ type: key, data: value });
+                for (const [k, v] of Object.entries(parsed.root)) {
+                    if (k !== '?xml' && k !== 'stream:stream') {
+                        out.push({ type: k, data: v });
+                    }
                 }
             }
-            return stanzas;
+            return out;
         } catch {
             return [];
         }
@@ -108,7 +134,12 @@ class SecureTCPServer {
 
     handleData(socket, data) {
         const msg = data.toString();
-        if (msg.includes('<stream:stream')) { if (socket.authenticated) this.sendStream(socket, true); return; }
+
+        if (msg.includes('<stream:stream')) {
+            if (socket.authenticated) this.sendStream(socket, true);
+            return;
+        }
+
         if (msg.includes('<starttls')) {
             socket.write(builder.build({ 'proceed': { '@_xmlns': 'urn:ietf:params:xml:ns:xmpp-tls' } }));
             const tlsSocket = new tls.TLSSocket(socket, { isServer: true, ...this.tlsOptions });
@@ -120,9 +151,9 @@ class SecureTCPServer {
         }
 
         if (msg.includes('<auth')) {
-            const authMatch = msg.match(/<auth[^>]*>([^<]*)<\/auth>/);
-            if (authMatch) {
-                const creds = this.parseSASLPlain(authMatch[1] || '');
+            const m = msg.match(/<auth[^>]*>([^<]*)<\/auth>/);
+            if (m) {
+                const creds = this.parseSASLPlain(m[1] || '');
                 if (this.authenticateClient(creds.username, creds.password)) {
                     socket.username = creds.username;
                     socket.fullJid = `${creds.username}@${this.domain}/${crypto.randomUUID()}`;
@@ -134,78 +165,140 @@ class SecureTCPServer {
             return;
         }
 
-        const stanzas = this.parseStanza(msg);
-        for (const stanza of stanzas) {
+        for (const stanza of this.parseStanza(msg)) {
             if (stanza.type === 'iq') this.handleIQ(socket, stanza.data);
-            else if (stanza.type === 'presence') this.handlePresence(socket, stanza.data);
-            else if (stanza.type === 'message') this.handleMessage(socket, stanza.data);
+            if (stanza.type === 'presence') this.handlePresence(socket, stanza.data);
+            if (stanza.type === 'message') this.handleMessage(socket, stanza.data);
         }
     }
 
     handleIQ(socket, iq) {
         const id = iq['@_id'];
+
         if (iq.bind) {
             const resource = iq.bind.resource || crypto.randomUUID();
             socket.fullJid = `${socket.username}@${this.domain}/${resource}`;
             socket.write(builder.build({
-                'iq': { '@_type': 'result', '@_id': id, 'bind': { '@_xmlns': 'urn:ietf:params:xml:ns:xmpp-bind', 'jid': socket.fullJid } }
+                'iq': {
+                    '@_type': 'result',
+                    '@_id': id,
+                    'bind': {
+                        '@_xmlns': 'urn:ietf:params:xml:ns:xmpp-bind',
+                        'jid': socket.fullJid
+                    }
+                }
             }));
             this.log_debug(`BIND ${socket.username} -> ${socket.fullJid}`);
             return;
         }
 
-        if (iq.session) {
-            socket.write(builder.build({ 'iq': { '@_type': 'result', '@_id': id } }));
-            return;
-        }
+        socket.write(builder.build({ 'iq': { '@_type': 'result', '@_id': id } }));
+    }
 
-        if (iq.ping || iq['ping:ping']) {
-            socket.write(builder.build({ 'iq': { '@_type': 'result', '@_id': id } }));
+    sendAllPresences(toSocket) {
+        for (const client of this.online.values()) {
+            if (client !== toSocket && client.authenticated) {
+                toSocket.write(builder.build({
+                    'presence': { '@_from': client.fullJid }
+                }));
+            }
+        }
+    }
+
+    broadcastPresence(fromSocket, xml) {
+        for (const client of this.clients.values()) {
+            if (client.authenticated && client !== fromSocket) {
+                client.write(xml);
+            }
         }
     }
 
     handlePresence(socket, presence) {
-        if (!socket.username) return;
-        const type = presence['@_type'];
-        if (type === 'unavailable') {
+        if (!socket.authenticated) return;
+
+        const to = presence['@_to'];
+
+        if (to && to.startsWith(this.globalRoom)) {
+            this.mucOccupants.set(socket.fullJid, socket);
+            const join = builder.build({
+                'presence': {
+                    '@_from': `${this.globalRoom}/${socket.username}`
+                }
+            });
+            socket.write(join);
+            this.log_debug(`MUC JOIN ${socket.username}`);
+            return;
+        }
+
+        if (presence['@_type'] === 'unavailable') {
             this.handleUnavailable(socket);
             return;
         }
 
-        const presenceStanza = { 'presence': { '@_from': socket.fullJid } };
-        if (presence.show) presenceStanza.presence.show = presence.show;
-        if (presence.status) presenceStanza.presence.status = presence.status;
-        const presenceXML = builder.build(presenceStanza);
+        this.online.set(socket.fullJid, socket);
 
-        this.presences.set(socket.fullJid, { username: socket.username, presence: presenceXML, socket });
+        const stanza = builder.build({
+            'presence': {
+                '@_from': socket.fullJid,
+                ...(presence.show ? { show: presence.show } : {}),
+                ...(presence.status ? { status: presence.status } : {})
+            }
+        });
 
-        for (const [_, client] of this.clients.entries()) {
-            if (client.authenticated && client !== socket) client.write(presenceXML);
-        }
+        this.broadcastPresence(socket, stanza);
+        this.sendAllPresences(socket);
 
         this.log_debug(`PRESENCE ${socket.username} (${socket.fullJid})`);
     }
 
     handleUnavailable(socket) {
-        if (!socket.username) return;
-        const unavailableStanza = builder.build({ 'presence': { '@_from': socket.fullJid, '@_type': 'unavailable' } });
-        for (const [_, client] of this.clients.entries()) {
-            if (client.authenticated && client !== socket) client.write(unavailableStanza);
-        }
-        this.presences.delete(socket.fullJid);
+        if (!socket.fullJid) return;
+
+        this.online.delete(socket.fullJid);
+        this.mucOccupants.delete(socket.fullJid);
+
+        const stanza = builder.build({
+            'presence': {
+                '@_from': socket.fullJid,
+                '@_type': 'unavailable'
+            }
+        });
+
+        this.broadcastPresence(socket, stanza);
+
         this.log_debug(`UNAVAILABLE ${socket.username} (${socket.fullJid})`);
     }
 
     handleMessage(socket, message) {
         const to = message['@_to'];
         const body = message.body;
-        console.log(message);
-        if (!body || !to) return;
+        if (!to || !body) return;
 
-        const toBase = to.split('/')[0];
-        for (const [fullJid, pres] of this.presences.entries()) {
-            if (fullJid.startsWith(toBase)) {
-                pres.socket.write(builder.build({ 'message': { '@_from': socket.fullJid, '@_to': fullJid, 'body': body, '@_type': message['@_type'] } }));
+        if (to === this.globalRoom || to.startsWith(`${this.globalRoom}/`)) {
+            for (const client of this.mucOccupants.values()) {
+                client.write(builder.build({
+                    'message': {
+                        '@_from': `${this.globalRoom}/${socket.username}`,
+                        '@_type': 'groupchat',
+                        'body': body
+                    }
+                }));
+            }
+            this.log_debug(`MUC MSG ${socket.username}`);
+            return;
+        }
+
+        const base = to.split('/')[0];
+        for (const client of this.online.values()) {
+            if (client.fullJid.startsWith(base)) {
+                client.write(builder.build({
+                    'message': {
+                        '@_from': socket.fullJid,
+                        '@_to': client.fullJid,
+                        '@_type': message['@_type'],
+                        'body': body
+                    }
+                }));
             }
         }
 
@@ -215,6 +308,7 @@ class SecureTCPServer {
     handleDisconnect(socket) {
         this.clients.delete(socket);
         this.handleUnavailable(socket);
+        if (socket.username) this.log_debug(`DISCONNECT ${socket.username}`);
     }
 }
 
