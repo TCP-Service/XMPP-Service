@@ -39,6 +39,7 @@ class SecureTCPServer {
         this.server = null;
         this.clients = new Map();
         this.online = new Map();
+        this.lastPresence = new Map();
         this.mucRooms = new Map();
     }
 
@@ -144,6 +145,8 @@ class SecureTCPServer {
             this.clients.delete(socket);
             this.clients.set(tlsSocket, tlsSocket);
             tlsSocket.on('data', d => this.handleData(tlsSocket, d));
+            tlsSocket.on('close', () => this.handleDisconnect(tlsSocket));
+            tlsSocket.on('error', () => this.handleDisconnect(tlsSocket));
             this.sendStream(tlsSocket, true);
             this.log_debug(`STARTTLS`);
             return;
@@ -199,15 +202,18 @@ class SecureTCPServer {
 
         const to = presence['@_to'];
 
-        const presencePayload = {
+        if (presence['@_type'] === 'unavailable') {
+            this.handleUnavailable(socket);
+            return;
+        }
+
+        const xml = builder.build({
             'presence': {
                 '@_from': socket.fullJid,
                 ...(presence.show ? { show: presence.show } : {}),
                 ...(presence.status ? { status: presence.status } : {})
             }
-        };
-
-        const xml = builder.build(presencePayload);
+        });
 
         if (to && to.includes('@') && to.split('@')[1].startsWith(this.mucDomain)) {
             const room = to.split('/')[0];
@@ -224,30 +230,30 @@ class SecureTCPServer {
             socket.roomNick = nick;
 
             socket.write(builder.build({
-                'presence': {
-                    '@_from': `${room}/${nick}`
-                }
+                'presence': { '@_from': `${room}/${nick}` }
             }));
 
             for (const client of occupants.values()) {
-                if (client !== socket) client.write(builder.build({
-                    'presence': {
-                        '@_from': `${room}/${nick}`,
-                        ...(presence.show ? { show: presence.show } : {}),
-                        ...(presence.status ? { status: presence.status } : {})
-                    }
-                }));
+                if (client !== socket) {
+                    client.write(builder.build({
+                        'presence': {
+                            '@_from': `${room}/${nick}`,
+                            ...(presence.show ? { show: presence.show } : {}),
+                            ...(presence.status ? { status: presence.status } : {})
+                        }
+                    }));
+                }
             }
 
             this.log_debug(`MUC PRESENCE ${nick} -> ${room}`);
             return;
         }
 
-        if (presence['@_type'] === 'unavailable') {
-            this.handleUnavailable(socket);
-            return;
+        for (const [jid, p] of this.lastPresence.entries()) {
+            if (jid !== socket.fullJid) socket.write(p);
         }
 
+        this.lastPresence.set(socket.fullJid, xml);
         this.online.set(socket.fullJid, socket);
 
         for (const client of this.online.values()) {
@@ -260,6 +266,7 @@ class SecureTCPServer {
     handleUnavailable(socket) {
         if (!socket.fullJid) return;
 
+        this.lastPresence.delete(socket.fullJid);
         this.online.delete(socket.fullJid);
 
         if (socket.currentRoom) {
@@ -284,6 +291,8 @@ class SecureTCPServer {
                 client.write(stanza);
             }
         }
+
+        this.log_debug(`UNAVAILABLE ${socket.username}`);
     }
 
     handleMessage(socket, message) {
