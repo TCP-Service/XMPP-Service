@@ -6,29 +6,25 @@ import xmpp_config from '../cfg/xmpp_config.js';
 import logging from '../utilities/log.js';
 import { XMLBuilder, XMLParser } from 'fast-xml-parser';
 
-const options = {
-    port: xmpp_config.server.port,
-    key: xmpp_config.certs.key,
-    cert: xmpp_config.certs.cert,
-    cert_bundle: xmpp_config.certs.ca_bundle
-}
-
 const parser = new XMLParser({
     ignoreAttributes: false,
-    attributeNamePrefix: ""
+    attributeNamePrefix: "@_",
+    parseAttributeValue: false,
+    trimValues: true,
+    parseTagValue: false
 });
 
 const builder = new XMLBuilder({
     ignoreAttributes: false,
-    attributeNamePrefix: "",
-    suppressEmptyNode: true
+    attributeNamePrefix: "@_",
+    suppressEmptyNode: true,
+    format: false
 });
 
 class SecureTCPServer {
     constructor(options = {}) {
         this.port = xmpp_config.server.port || 5222;
         this.host = xmpp_config.server.ip || '0.0.0.0';
-
         this.tlsOptions = {
             key: fs.readFileSync(options.key || 'cfg/certificate/private.key'),
             cert: fs.readFileSync(options.cert || 'cfg/certificate/certificate.crt'),
@@ -36,16 +32,10 @@ class SecureTCPServer {
             rejectUnauthorized: false,
             secureProtocol: 'TLS_method'
         };
-
         this.domain = xmpp_config.host.domain;
-        this.mucDomain = `${xmpp_config.options.muc_name}.${this.domain}`;
-        this.roomJid = `${xmpp_config.options.global_chat_name}@${this.mucDomain}`;
-
         this.server = null;
         this.clients = new Map();
-        this.presences = new Map(); // username -> xml
-
-        this.mucRoom = new Map(); // nick -> socket
+        this.presences = new Map();
     }
 
     start() {
@@ -64,16 +54,8 @@ class SecureTCPServer {
         );
     }
 
-    log(msg) {
-        logging.xmpp(`${msg}`);
-    }
-
-    log_debug(msg) {
-        // logging.xmpp(`${msg}`);
-        if (xmpp_config.log_debug) {
-            logging.debug(`${msg}`);
-        }
-    }
+    log(msg) { logging.xmpp(`${msg}`); }
+    log_debug(msg) { if (xmpp_config.log_debug) logging.debug(`${msg}`); }
 
     authenticateClient(username, password) {
         this.log_debug(`AUTH attempt ${username}`);
@@ -86,39 +68,49 @@ class SecureTCPServer {
     }
 
     sendStream(socket, encrypted = false) {
-        socket.write(`<?xml version='1.0'?>
-<stream:stream xmlns='jabber:client'
-xmlns:stream='http://etherx.jabber.org/streams'
-from='${this.domain}'
-id='${crypto.randomUUID()}'
-version='1.0'>`);
+        const streamOpen = builder.build({
+            '?xml': { '@_version': '1.0' },
+            'stream:stream': {
+                '@_xmlns': 'jabber:client',
+                '@_xmlns:stream': 'http://etherx.jabber.org/streams',
+                '@_from': this.domain,
+                '@_id': crypto.randomUUID(),
+                '@_version': '1.0'
+            }
+        });
+
+        socket.write(streamOpen.replace('/>', '>'));
 
         if (!encrypted) {
-            socket.write(`
-<stream:features>
-<starttls xmlns='urn:ietf:params:xml:ns:xmpp-tls'><required/></starttls>
-</stream:features>`);
+            socket.write(builder.build({ 'stream:features': { 'starttls': { '@_xmlns': 'urn:ietf:params:xml:ns:xmpp-tls', 'required': '' } } }));
         } else if (!socket.authenticated) {
-            socket.write(`
-<stream:features>
-<mechanisms xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>
-<mechanism>PLAIN</mechanism>
-</mechanisms>
-</stream:features>`);
+            socket.write(builder.build({ 'stream:features': { 'mechanisms': { '@_xmlns': 'urn:ietf:params:xml:ns:xmpp-sasl', 'mechanism': 'PLAIN' } } }));
         } else {
-            socket.write(`
-<stream:features>
-<bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'/>
-<session xmlns='urn:ietf:params:xml:ns:xmpp-session'/>
-</stream:features>`);
+            socket.write(builder.build({ 'stream:features': { 'bind': { '@_xmlns': 'urn:ietf:params:xml:ns:xmpp-bind' }, 'session': { '@_xmlns': 'urn:ietf:params:xml:ns:xmpp-session' } } }));
+        }
+    }
+
+    parseStanza(msg) {
+        try {
+            const stanzas = [];
+            const wrapped = `<root>${msg}</root>`;
+            const parsed = parser.parse(wrapped);
+            if (parsed.root) {
+                for (const [key, value] of Object.entries(parsed.root)) {
+                    if (key !== '?xml' && key !== 'stream:stream') stanzas.push({ type: key, data: value });
+                }
+            }
+            return stanzas;
+        } catch {
+            return [];
         }
     }
 
     handleData(socket, data) {
         const msg = data.toString();
-
+        if (msg.includes('<stream:stream')) { if (socket.authenticated) this.sendStream(socket, true); return; }
         if (msg.includes('<starttls')) {
-            socket.write(`<proceed xmlns='urn:ietf:params:xml:ns:xmpp-tls'/>`);
+            socket.write(builder.build({ 'proceed': { '@_xmlns': 'urn:ietf:params:xml:ns:xmpp-tls' } }));
             const tlsSocket = new tls.TLSSocket(socket, { isServer: true, ...this.tlsOptions });
             this.clients.delete(socket);
             this.clients.set(tlsSocket, tlsSocket);
@@ -126,124 +118,104 @@ version='1.0'>`);
             this.sendStream(tlsSocket, true);
             return;
         }
-        else if (msg.includes('<auth')) {
-            const creds = this.parseSASLPlain(msg.match(/>([^<]+)</)?.[1] || '');
-            if (this.authenticateClient(creds.username, creds.password)) {
-                socket.username = creds.username;
-                socket.fullJid = `${creds.username}@${this.domain}/res`;
-                socket.authenticated = true;
-                socket.write(`<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>`);
-                this.log_debug(`AUTH OK ${socket.username}`);
-            }
-            return;
-        }
-        else if (msg.includes('<stream:stream') && socket.authenticated) {
-            this.sendStream(socket, true);
-            return;
-        }
-        else if (msg.includes('<iq') && msg.includes('bind')) {
-            const id = msg.match(/id=['"]([^'"]+)['"]/)?.[1];
-            socket.write(`<iq type='result' id='${id}'>
-<bind xmlns='urn:ietf:params:xml:ns:xmpp-bind'>
-<jid>${socket.fullJid}</jid>
-</bind>
-</iq>`);
-            return;
-        }
-        else if (msg.includes('<iq') && msg.includes('session')) {
-            const id = msg.match(/id=['"]([^'"]+)['"]/)?.[1];
-            socket.write(`<iq type='result' id='${id}'/>`);
-            return;
-        }
-        else if (msg.includes("<presence") && msg.includes("type='subscribe'")) {
-            const to = msg.match(/to=['"]([^'"]+)['"]/)?.[1];
-            socket.write(`<presence to='${to}' from='${socket.fullJid}' type='subscribed'/>`);
-            return;
-        }
-        else if (msg.includes('<presence') && msg.includes(this.roomJid)) {
-            const nick = msg.match(/\/([^'"]+)/)?.[1] || socket.username;
-            socket.mucNick = nick;
-            this.mucRoom.set(nick, socket);
 
-            for (const [_, s] of this.mucRoom) {
-                s.write(`<presence from='${this.roomJid}/${nick}'/>`);
-            }
-
-            this.log_debug(`MUC JOIN ${nick}`);
-            return;
-        }
-        else if (msg.includes('<presence')) {
-            const p = msg.includes('from=')
-                ? msg
-                : msg.replace('<presence', `<presence from='${socket.fullJid}'`);
-            this.presences.set(socket.username, p);
-            for (const [_, s] of this.clients) {
-                if (s !== socket && s.authenticated) s.write(p);
-            }
-            this.log_debug(`PRESENCE ${socket.username}`);
-            return;
-        }
-        else if (msg.includes('<message') && msg.includes(this.roomJid)) {
-            const body = msg.match(/<body>([^<]+)<\/body>/)?.[1];
-            if (!body) return;
-
-            for (const [_, s] of this.mucRoom) {
-                s.write(`<message type='groupchat'
-from='${this.roomJid}/${socket.mucNick}'>
-<body>${body}</body>
-</message>`);
-            }
-            this.log_debug(`MUC MSG ${socket.mucNick}: ${body}`);
-            return;
-        }
-        else if (msg.includes('<message')) {
-            const to = msg.match(/to=['"]([^'"]+)['"]/)?.[1];
-            const body = msg.match(/<body>([^<]+)<\/body>/)?.[1];
-            if (!to || !body) return;
-
-            for (const [_, s] of this.clients) {
-                if (s.fullJid?.startsWith(to.split('/')[0])) {
-                    s.write(`<message from='${socket.fullJid}' to='${to}'>
-<body>${body}</body>
-</message>`);
+        if (msg.includes('<auth')) {
+            const authMatch = msg.match(/<auth[^>]*>([^<]*)<\/auth>/);
+            if (authMatch) {
+                const creds = this.parseSASLPlain(authMatch[1] || '');
+                if (this.authenticateClient(creds.username, creds.password)) {
+                    socket.username = creds.username;
+                    socket.fullJid = `${creds.username}@${this.domain}/${crypto.randomUUID()}`;
+                    socket.authenticated = true;
+                    socket.write(builder.build({ 'success': { '@_xmlns': 'urn:ietf:params:xml:ns:xmpp-sasl' } }));
+                    this.log_debug(`AUTH OK ${socket.username}`);
                 }
             }
-            this.log_debug(`MSG ${socket.username} -> ${to}`);
+            return;
         }
-        else if (msg.includes('<ping:ping')) {
-            this.log_debug('PING received from client.');
 
-            const obj = parser.parse(msg);
-            const id = obj.iq.id;
+        const stanzas = this.parseStanza(msg);
+        for (const stanza of stanzas) {
+            console.log(stanza.type)
+            if (stanza.type === 'iq') this.handleIQ(socket, stanza.data);
+            else if (stanza.type === 'presence') this.handlePresence(socket, stanza.data);
+            else if (stanza.type === 'message') this.handleMessage(socket, stanza.data);
+        }
+    }
 
+    handleIQ(socket, iq) {
+        const id = iq['@_id'];
+        if (iq.bind) {
+            const resource = iq.bind.resource || crypto.randomUUID();
+            socket.fullJid = `${socket.username}@${this.domain}/${resource}`;
             socket.write(builder.build({
-                id: {
-                    type: 'result',
-                    id: id
-                }
-            }))
+                'iq': { '@_type': 'result', '@_id': id, 'bind': { '@_xmlns': 'urn:ietf:params:xml:ns:xmpp-bind', 'jid': socket.fullJid } }
+            }));
+            this.log_debug(`BIND ${socket.username} -> ${socket.fullJid}`);
+            return;
         }
-        else {
-            this.log_debug(`Unknown message received from client. ${msg}`);
+
+        if (iq.session) {
+            socket.write(builder.build({ 'iq': { '@_type': 'result', '@_id': id } }));
+            return;
         }
+
+        if (iq.ping || iq['ping:ping']) {
+            socket.write(builder.build({ 'iq': { '@_type': 'result', '@_id': id } }));
+        }
+    }
+
+    handlePresence(socket, presence) {
+        if (!socket.username) return;
+        const type = presence['@_type'];
+        if (type === 'unavailable') {
+            this.handleUnavailable(socket);
+            return;
+        }
+
+        const presenceStanza = { 'presence': { '@_from': socket.fullJid } };
+        if (presence.show) presenceStanza.presence.show = presence.show;
+        if (presence.status) presenceStanza.presence.status = presence.status;
+        const presenceXML = builder.build(presenceStanza);
+
+        this.presences.set(socket.fullJid, { username: socket.username, presence: presenceXML, socket });
+
+        for (const [_, client] of this.clients.entries()) {
+            if (client.authenticated && client !== socket) client.write(presenceXML);
+        }
+
+        this.log_debug(`PRESENCE ${socket.username} (${socket.fullJid})`);
+    }
+
+    handleUnavailable(socket) {
+        if (!socket.username) return;
+        const unavailableStanza = builder.build({ 'presence': { '@_from': socket.fullJid, '@_type': 'unavailable' } });
+        for (const [_, client] of this.clients.entries()) {
+            if (client.authenticated && client !== socket) client.write(unavailableStanza);
+        }
+        this.presences.delete(socket.fullJid);
+        this.log_debug(`UNAVAILABLE ${socket.username} (${socket.fullJid})`);
+    }
+
+    handleMessage(socket, message) {
+        const to = message['@_to'];
+        const body = message.body;
+        console.log(message);
+        if (!body || !to) return;
+
+        const toBase = to.split('/')[0];
+        for (const [fullJid, pres] of this.presences.entries()) {
+            if (fullJid.startsWith(toBase)) {
+                pres.socket.write(builder.build({ 'message': { '@_from': socket.fullJid, '@_to': fullJid, 'body': body } }));
+            }
+        }
+
+        this.log_debug(`MSG ${socket.username} -> ${to}`);
     }
 
     handleDisconnect(socket) {
         this.clients.delete(socket);
-
-        if (socket.username) {
-            const u = `<presence from='${socket.fullJid}' type='unavailable'/>`;
-            for (const [_, s] of this.clients) s.write(u);
-            this.presences.delete(socket.username);
-        }
-
-        if (socket.mucNick) {
-            this.mucRoom.delete(socket.mucNick);
-            for (const [_, s] of this.mucRoom) {
-                s.write(`<presence from='${this.roomJid}/${socket.mucNick}' type='unavailable'/>`);
-            }
-            this.log_debug(`MUC LEAVE ${socket.mucNick}`);
-        }
+        this.handleUnavailable(socket);
     }
 }
 
