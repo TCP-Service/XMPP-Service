@@ -22,12 +22,11 @@ const builder = new XMLBuilder({
 });
 
 class SecureTCPServer {
-    constructor(options = {}) {
+    constructor() {
         this.port = xmpp_config.server.port || 5222;
         this.host = xmpp_config.server.ip || '0.0.0.0';
         this.domain = xmpp_config.host.domain;
         this.mucDomain = `${xmpp_config.options.muc_name}.${this.domain}`;
-        this.globalRoom = `${xmpp_config.options.global_chat_name}@${this.mucDomain}`;
 
         this.tlsOptions = {
             key: fs.readFileSync(xmpp_config.certs.key),
@@ -40,7 +39,7 @@ class SecureTCPServer {
         this.server = null;
         this.clients = new Map();
         this.online = new Map();
-        this.mucOccupants = new Map();
+        this.mucRooms = new Map();
     }
 
     log(msg) { logging.xmpp(`${msg}`); }
@@ -51,7 +50,6 @@ class SecureTCPServer {
             this.clients.set(socket, socket);
             this.log_debug(`CONNECT ${socket.remoteAddress}`);
             this.sendStream(socket);
-
             socket.on('data', d => this.handleData(socket, d));
             socket.on('close', () => this.handleDisconnect(socket));
             socket.on('error', () => this.handleDisconnect(socket));
@@ -62,7 +60,7 @@ class SecureTCPServer {
         );
     }
 
-    authenticateClient(username, password) {
+    authenticateClient(username) {
         this.log_debug(`AUTH attempt ${username}`);
         return true;
     }
@@ -147,6 +145,7 @@ class SecureTCPServer {
             this.clients.set(tlsSocket, tlsSocket);
             tlsSocket.on('data', d => this.handleData(tlsSocket, d));
             this.sendStream(tlsSocket, true);
+            this.log_debug(`STARTTLS`);
             return;
         }
 
@@ -195,38 +194,32 @@ class SecureTCPServer {
         socket.write(builder.build({ 'iq': { '@_type': 'result', '@_id': id } }));
     }
 
-    sendAllPresences(toSocket) {
-        for (const client of this.online.values()) {
-            if (client !== toSocket && client.authenticated) {
-                toSocket.write(builder.build({
-                    'presence': { '@_from': client.fullJid }
-                }));
-            }
-        }
-    }
-
-    broadcastPresence(fromSocket, xml) {
-        for (const client of this.clients.values()) {
-            if (client.authenticated && client !== fromSocket) {
-                client.write(xml);
-            }
-        }
-    }
-
     handlePresence(socket, presence) {
         if (!socket.authenticated) return;
 
         const to = presence['@_to'];
 
-        if (to && to.startsWith(this.globalRoom)) {
-            this.mucOccupants.set(socket.fullJid, socket);
-            const join = builder.build({
+        if (to && to.includes('@') && to.split('@')[1].startsWith(this.mucDomain)) {
+            const room = to.split('/')[0];
+            const nick = to.split('/')[1] || socket.username;
+
+            if (!this.mucRooms.has(room)) {
+                this.mucRooms.set(room, new Map());
+                this.log_debug(`MUC CREATE ${room}`);
+            }
+
+            const occupants = this.mucRooms.get(room);
+            occupants.set(socket.fullJid, socket);
+            socket.currentRoom = room;
+            socket.roomNick = nick;
+
+            socket.write(builder.build({
                 'presence': {
-                    '@_from': `${this.globalRoom}/${socket.username}`
+                    '@_from': `${room}/${nick}`
                 }
-            });
-            socket.write(join);
-            this.log_debug(`MUC JOIN ${socket.username}`);
+            }));
+
+            this.log_debug(`MUC JOIN ${nick} -> ${room}`);
             return;
         }
 
@@ -239,14 +232,13 @@ class SecureTCPServer {
 
         const stanza = builder.build({
             'presence': {
-                '@_from': socket.fullJid,
-                ...(presence.show ? { show: presence.show } : {}),
-                ...(presence.status ? { status: presence.status } : {})
+                '@_from': socket.fullJid
             }
         });
 
-        this.broadcastPresence(socket, stanza);
-        this.sendAllPresences(socket);
+        for (const client of this.online.values()) {
+            if (client !== socket) client.write(stanza);
+        }
 
         this.log_debug(`PRESENCE ${socket.username} (${socket.fullJid})`);
     }
@@ -255,7 +247,12 @@ class SecureTCPServer {
         if (!socket.fullJid) return;
 
         this.online.delete(socket.fullJid);
-        this.mucOccupants.delete(socket.fullJid);
+
+        if (socket.currentRoom && this.mucRooms.has(socket.currentRoom)) {
+            const room = this.mucRooms.get(socket.currentRoom);
+            room.delete(socket.fullJid);
+            this.log_debug(`MUC LEAVE ${socket.username} -> ${socket.currentRoom}`);
+        }
 
         const stanza = builder.build({
             'presence': {
@@ -264,7 +261,11 @@ class SecureTCPServer {
             }
         });
 
-        this.broadcastPresence(socket, stanza);
+        for (const client of this.clients.values()) {
+            if (client !== socket && client.authenticated) {
+                client.write(stanza);
+            }
+        }
 
         this.log_debug(`UNAVAILABLE ${socket.username} (${socket.fullJid})`);
     }
@@ -274,17 +275,18 @@ class SecureTCPServer {
         const body = message.body;
         if (!to || !body) return;
 
-        if (to === this.globalRoom || to.startsWith(`${this.globalRoom}/`)) {
-            for (const client of this.mucOccupants.values()) {
+        if (this.mucRooms.has(to)) {
+            const room = this.mucRooms.get(to);
+            for (const client of room.values()) {
                 client.write(builder.build({
                     'message': {
-                        '@_from': `${this.globalRoom}/${socket.username}`,
+                        '@_from': `${to}/${socket.roomNick || socket.username}`,
                         '@_type': 'groupchat',
                         'body': body
                     }
                 }));
             }
-            this.log_debug(`MUC MSG ${socket.username}`);
+            this.log_debug(`MUC MSG ${socket.username} -> ${to}`);
             return;
         }
 
