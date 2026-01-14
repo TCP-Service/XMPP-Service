@@ -10,6 +10,7 @@ import registerRoutes from './utilities/routes.js';
 import { fileURLToPath } from 'url';
 
 const nodeVersion = process.version;
+const majorVersion = Number(nodeVersion.replace(/[a-z]/gi, '').split('.')[0]);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -47,7 +48,13 @@ registerRoutes(app).then(() => {
 
     tcpServer.server.start();
 
-    if (nodeVersion !== 'v16.20.3') {
-        logging.warn("It's suggested that you run the XMPP server using Node.js v16.20.2 or lower. If you are on lower then ignore this warning.");
+    // I've changed this so it's easier for ppl to understand and download the right version
+    // and I made it just check the major version (even tho 17 and 18 might still work)
+
+    if (majorVersion > 16) {
+        logging.warn(
+            "TLS 1.0 is required for XMPP to function on older seasons (1-3). We recommend using " +
+            "\x1b]8;;https://nodejs.org/dist/v16.20.2/node-v16.20.2-x64.msi\x1b\\Node.js v16 or lower.\x1b]8;;\x1b\\"
+        );
     }
 });

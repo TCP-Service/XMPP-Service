@@ -41,7 +41,7 @@ class SecureTCPServer {
         this.online = new Map();
         this.lastPresence = new Map();
         this.mucRooms = new Map();
-        this.roomMembership = new Map();
+        this.mucMembers = new Map();
     }
 
     log(msg) { logging.xmpp(`${msg}`); }
@@ -60,38 +60,6 @@ class SecureTCPServer {
         this.server.listen(this.port, this.host, () =>
             this.log(`XMPP running on ${this.host}:${this.port}`)
         );
-
-        const shutdown = () => {
-            this.log(`Server shutting down, disconnecting all clients...`);
-            this.disconnectAllClients();
-            this.server.close(() => {
-                this.log(`Server closed`);
-                process.exit(0);
-            });
-        };
-
-        process.on('SIGINT', shutdown);
-        process.on('SIGTERM', shutdown);
-    }
-
-    disconnectAllClients() {
-        const clientCount = this.clients.size;
-        this.log(`Disconnecting ${clientCount} clients...`);
-
-        for (const socket of this.clients.keys()) {
-            try {
-                socket.destroy();
-            } catch (e) {
-            }
-        }
-
-        this.clients.clear();
-        this.online.clear();
-        this.lastPresence.clear();
-        this.mucRooms.clear();
-        this.roomMembership.clear();
-
-        this.log(`All clients disconnected`);
     }
 
     authenticateClient(username) {
@@ -254,16 +222,12 @@ class SecureTCPServer {
             const parts = to.split('@');
             if (parts.length >= 2) {
                 const toDomain = parts[1].split('/')[0];
-                this.log_debug(`PRESENCE CHECK: to=${to}, domain=${toDomain}, mucDomain=${this.mucDomain}`);
-
                 if (toDomain === this.mucDomain || toDomain.endsWith('.' + this.mucDomain) || this.mucDomain.endsWith('.' + toDomain)) {
                     const room = to.split('/')[0];
                     const nick = to.split('/')[1] || socket.username;
 
                     const roomExists = this.mucRooms.has(room);
                     const userInRoom = roomExists && this.mucRooms.get(room).has(socket.fullJid);
-
-                    this.log_debug(`MUC JOIN ATTEMPT: room=${room}, exists=${roomExists}, userAlreadyIn=${userInRoom}, occupants=${roomExists ? this.mucRooms.get(room).size : 0}`);
 
                     if (!this.mucRooms.has(room)) {
                         this.mucRooms.set(room, new Map());
@@ -272,14 +236,12 @@ class SecureTCPServer {
 
                     const occupants = this.mucRooms.get(room);
 
-                    const alreadyInRoom = occupants.has(socket.fullJid);
-
                     occupants.set(socket.fullJid, socket);
 
-                    if (!this.roomMembership.has(socket.fullJid)) {
-                        this.roomMembership.set(socket.fullJid, new Map());
+                    if (!this.mucMembers.has(socket.fullJid)) {
+                        this.mucMembers.set(socket.fullJid, new Map());
                     }
-                    this.roomMembership.get(socket.fullJid).set(room, nick);
+                    this.mucMembers.get(socket.fullJid).set(room, nick);
 
                     socket.write(builder.build({
                         'presence': { '@_from': `${room}/${nick}` }
@@ -297,9 +259,6 @@ class SecureTCPServer {
                         }
                     }
 
-                    this.log_debug(`MUC ${alreadyInRoom ? 'REJOIN' : 'PRESENCE'} ${nick} -> ${room} (${occupants.size} occupants)`);
-
-                    this.log_debug(`ALL MUC ROOMS (${this.mucRooms.size} total):`);
                     for (const [roomJid, roomOccupants] of this.mucRooms.entries()) {
                         const occupantList = Array.from(roomOccupants.keys()).map(jid => {
                             const username = jid.split('@')[0];
@@ -337,7 +296,7 @@ class SecureTCPServer {
 
                 if (toDomain === this.mucDomain || toDomain.endsWith('.' + this.mucDomain) || this.mucDomain.endsWith('.' + toDomain)) {
                     const room = to.split('/')[0];
-                    const userRooms = this.roomMembership.get(socket.fullJid);
+                    const userRooms = this.mucMembers.get(socket.fullJid);
 
                     if (userRooms && userRooms.has(room)) {
                         const nick = userRooms.get(room);
@@ -363,7 +322,7 @@ class SecureTCPServer {
 
                         userRooms.delete(room);
                         if (userRooms.size === 0) {
-                            this.roomMembership.delete(socket.fullJid);
+                            this.mucMembers.delete(socket.fullJid);
                         }
 
                         this.log_debug(`MUC LEAVE ${socket.username} from ${room}`);
@@ -376,7 +335,7 @@ class SecureTCPServer {
         this.lastPresence.delete(socket.fullJid);
         this.online.delete(socket.fullJid);
 
-        const userRooms = this.roomMembership.get(socket.fullJid);
+        const userRooms = this.mucMembers.get(socket.fullJid);
         if (userRooms) {
             for (const [room, nick] of userRooms.entries()) {
                 const occupants = this.mucRooms.get(room);
@@ -398,7 +357,7 @@ class SecureTCPServer {
                     }
                 }
             }
-            this.roomMembership.delete(socket.fullJid);
+            this.mucMembers.delete(socket.fullJid);
         }
 
         const stanza = builder.build({
@@ -422,22 +381,6 @@ class SecureTCPServer {
         const body = message.body;
         if (!to || !body) return;
 
-        try {
-            const bodyData = JSON.parse(body);
-
-            if (bodyData.type === 'com.epicgames.party.memberjoined' && bodyData.payload) {
-                const payload = JSON.parse(bodyData.payload);
-                if (payload.partyId && payload.newMemberId) {
-                    this.autoJoinUserToMucRoom(
-                        payload.newMemberId,
-                        payload.partyId,
-                        payload.newMemberDisplayName
-                    );
-                }
-            }
-        } catch (e) {
-        }
-
         if (to.includes('@')) {
             const parts = to.split('@');
             if (parts.length >= 2) {
@@ -454,11 +397,11 @@ class SecureTCPServer {
 
                             occupants.set(socket.fullJid, socket);
 
-                            if (!this.roomMembership.has(socket.fullJid)) {
-                                this.roomMembership.set(socket.fullJid, new Map());
+                            if (!this.mucMembers.has(socket.fullJid)) {
+                                this.mucMembers.set(socket.fullJid, new Map());
                             }
                             const nick = socket.username;
-                            this.roomMembership.get(socket.fullJid).set(room, nick);
+                            this.mucMembers.get(socket.fullJid).set(room, nick);
 
                             socket.write(builder.build({
                                 'presence': { '@_from': `${room}/${nick}` }
@@ -475,7 +418,7 @@ class SecureTCPServer {
                             }
                         }
 
-                        const userRooms = this.roomMembership.get(socket.fullJid);
+                        const userRooms = this.mucMembers.get(socket.fullJid);
                         const nick = (userRooms && userRooms.has(room)) ? userRooms.get(room) : socket.username;
 
                         for (const client of occupants.values()) {
@@ -487,7 +430,6 @@ class SecureTCPServer {
                                 }
                             }));
                         }
-                        this.log_debug(`MUC MSG ${socket.username} -> ${to}`);
                         return;
                     }
                 }
@@ -507,16 +449,82 @@ class SecureTCPServer {
                 }));
             }
         }
-
-        this.log_debug(`MSG ${socket.username} -> ${to}`);
     }
+
 
     handleDisconnect(socket) {
         this.clients.delete(socket);
         this.handleUnavailable(socket);
         if (socket.username) this.log_debug(`DISCONNECT ${socket.username}`);
     }
+
+    shutdown() {
+        this.log('Disconnecting all clients');
+
+        const kickStanza = builder.build({
+            'stream:error': {
+                'policy-violation': { '@_xmlns': 'urn:ietf:params:xml:ns:xmpp-streams' }
+            }
+        });
+
+        for (const socket of this.clients.values()) {
+            try {
+                if (socket.authenticated) {
+                    socket.write(kickStanza);
+                }
+                socket.destroy();
+            } catch (e) { }
+        }
+
+        this.clients.clear();
+        this.online.clear();
+        this.lastPresence.clear();
+        this.mucRooms.clear();
+        this.mucMembers.clear();
+
+        if (this.server) {
+            this.server.close(() => this.log('Server socket closed'));
+        }
+    }
+
+    leaveAllRooms(socket) {
+        if (!socket.fullJid || !this.mucMembers.has(socket.fullJid)) return;
+
+        const userRooms = this.mucMembers.get(socket.fullJid);
+
+        for (const [room, nick] of userRooms.entries()) {
+            const occupants = this.mucRooms.get(room);
+            if (occupants) {
+                for (const client of occupants.values()) {
+                    if (client !== socket) {
+                        client.write(builder.build({
+                            'presence': {
+                                '@_from': `${room}/${nick}`,
+                                '@_type': 'unavailable'
+                            }
+                        }));
+                    }
+                }
+
+                occupants.delete(socket.fullJid);
+                if (occupants.size === 0) this.mucRooms.delete(room);
+            }
+        }
+
+        this.mucMembers.delete(socket.fullJid);
+    }
+
 }
 
 const server = new SecureTCPServer();
 export default { server };
+
+process.on('SIGINT', () => {
+    server.shutdown();
+    process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+    server.shutdown();
+    process.exit(0);
+});
