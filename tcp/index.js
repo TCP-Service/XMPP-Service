@@ -486,34 +486,6 @@ class SecureTCPServer {
             this.server.close(() => this.log('Server socket closed'));
         }
     }
-
-    leaveAllRooms(socket) {
-        if (!socket.fullJid || !this.mucMembers.has(socket.fullJid)) return;
-
-        const userRooms = this.mucMembers.get(socket.fullJid);
-
-        for (const [room, nick] of userRooms.entries()) {
-            const occupants = this.mucRooms.get(room);
-            if (occupants) {
-                for (const client of occupants.values()) {
-                    if (client !== socket) {
-                        client.write(builder.build({
-                            'presence': {
-                                '@_from': `${room}/${nick}`,
-                                '@_type': 'unavailable'
-                            }
-                        }));
-                    }
-                }
-
-                occupants.delete(socket.fullJid);
-                if (occupants.size === 0) this.mucRooms.delete(room);
-            }
-        }
-
-        this.mucMembers.delete(socket.fullJid);
-    }
-
 }
 
 const server = new SecureTCPServer();
