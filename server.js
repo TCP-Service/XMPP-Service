@@ -36,6 +36,7 @@ process.on('unhandledRejection', (reason, promise) => {
 });
 
 process.on('uncaughtException', (err) => {
+    tcpServer.default.server.shutdown();
     logging.error(`Uncaught exception! | ${err.stack}`);
     process.exit(1);
 });
