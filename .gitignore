@@ -2,3 +2,5 @@
 cfg/certificate/ca_bundle.crt
 cfg/certificate/certificate.crt
 cfg/certificate/private.key
+cfg/xmpp_config.js
+cfg/rest_config.js
