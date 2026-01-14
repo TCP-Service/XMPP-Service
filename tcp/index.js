@@ -5,6 +5,7 @@ import net from 'net';
 import xmpp_config from '../cfg/xmpp_config.js';
 import logging from '../utilities/log.js';
 import { XMLBuilder, XMLParser } from 'fast-xml-parser';
+import forge from 'node-forge';
 
 const parser = new XMLParser({
     ignoreAttributes: false,
@@ -25,8 +26,6 @@ class SecureTCPServer {
     constructor() {
         this.port = xmpp_config.server.port || 5222;
         this.host = xmpp_config.server.ip || '0.0.0.0';
-        this.domain = xmpp_config.host.domain;
-        this.mucDomain = `${xmpp_config.options.muc_name}.${this.domain}`;
 
         this.tlsOptions = {
             key: fs.readFileSync(xmpp_config.certs.key),
@@ -35,6 +34,12 @@ class SecureTCPServer {
             rejectUnauthorized: false,
             secureProtocol: 'TLS_method'
         };
+
+        const pem = this.tlsOptions.cert.toString('utf8');
+        const cert = forge.pki.certificateFromPem(pem);
+
+        this.domain = cert.subject.getField('CN').value || 'prod.ol.epicgames.com';
+        this.mucDomain = `${xmpp_config.options.muc_name}.${this.domain}`;
 
         this.server = null;
         this.clients = new Map();
@@ -203,8 +208,6 @@ class SecureTCPServer {
 
         const to = presence['@_to'];
 
-        this.log_debug(`PRESENCE RECV: from=${socket.username}, to=${to || 'broadcast'}, type=${presence['@_type'] || 'available'}`);
-
         if (presence['@_type'] === 'unavailable') {
             this.handleUnavailable(socket, to);
             return;
@@ -214,7 +217,11 @@ class SecureTCPServer {
             'presence': {
                 '@_from': socket.fullJid,
                 ...(presence.show ? { show: presence.show } : {}),
-                ...(presence.status ? { status: presence.status } : {})
+                ...(presence.status ? (() => {
+                    const s = JSON.parse(presence.status);
+                    return { status: JSON.stringify({ ...s, Status: xmpp_config.options.show_version_in_status ? `test ${s.Status || ''}` : s.Status }) };
+                })() : {})
+
             }
         });
 
@@ -225,9 +232,6 @@ class SecureTCPServer {
                 if (toDomain === this.mucDomain || toDomain.endsWith('.' + this.mucDomain) || this.mucDomain.endsWith('.' + toDomain)) {
                     const room = to.split('/')[0];
                     const nick = to.split('/')[1] || socket.username;
-
-                    const roomExists = this.mucRooms.has(room);
-                    const userInRoom = roomExists && this.mucRooms.get(room).has(socket.fullJid);
 
                     if (!this.mucRooms.has(room)) {
                         this.mucRooms.set(room, new Map());
@@ -264,7 +268,6 @@ class SecureTCPServer {
                             const username = jid.split('@')[0];
                             return username;
                         }).join(', ');
-                        this.log_debug(`  ${roomJid} - ${roomOccupants.size} occupants: [${occupantList}]`);
                     }
 
                     return;
@@ -282,8 +285,6 @@ class SecureTCPServer {
         for (const client of this.online.values()) {
             if (client !== socket) client.write(xml);
         }
-
-        this.log_debug(`PRESENCE ${socket.username} (${socket.fullJid})`);
     }
 
     handleUnavailable(socket, to) {
@@ -372,8 +373,6 @@ class SecureTCPServer {
                 client.write(stanza);
             }
         }
-
-        this.log_debug(`UNAVAILABLE ${socket.username}`);
     }
 
     handleMessage(socket, message) {
