@@ -18,6 +18,10 @@ class Logging {
     debug(message) {
         console.log(`\x1b[34m[DEBUG]\x1b[0m ${message}`);
     }
+
+    config(message) {
+        console.log(`\x1b[90m[CONFIG]\x1b[0m ${message}`);
+    }
 }
 
 export default new Logging();

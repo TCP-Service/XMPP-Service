@@ -27,18 +27,34 @@ class SecureTCPServer {
         this.port = xmpp_config.server.port || 5222;
         this.host = xmpp_config.server.ip || '0.0.0.0';
 
-        this.tlsOptions = {
-            key: fs.readFileSync(xmpp_config.certs.key),
-            cert: fs.readFileSync(xmpp_config.certs.cert),
-            ca: fs.readFileSync(xmpp_config.certs.ca_bundle),
-            rejectUnauthorized: false,
-            secureProtocol: 'TLS_method'
-        };
+        this.tlsOptions = null;
+        let cert, validTo;
 
-        const pem = this.tlsOptions.cert.toString('utf8');
-        const cert = forge.pki.certificateFromPem(pem);
+        try {
+            this.tlsOptions = {
+                key: fs.readFileSync(xmpp_config.certs.key),
+                cert: fs.readFileSync(xmpp_config.certs.cert),
+                ca: fs.readFileSync(xmpp_config.certs.ca_bundle),
+                rejectUnauthorized: false,
+                secureProtocol: 'TLS_method'
+            };
 
-        this.domain = cert.subject.getField('CN').value || 'prod.ol.epicgames.com';
+            const pem = this.tlsOptions.cert.toString('utf8');
+            cert = forge.pki.certificateFromPem(pem);
+            validTo = cert.validity.notAfter;
+
+            if (validTo < new Date()) {
+                throw new Error('Certificate expired');
+            }
+        } catch (e) {
+            logging.warn(
+                "SSL Disabled - Your certificate is expired. Go to " +
+                "\x1b]8;;https://app.zerossl.com/certificate/new\x1b\\ZeroSSL\x1b]8;;\x1b\\ " +
+                "to request a new one."
+            );
+        }
+
+        this.domain = cert?.subject?.getField('CN')?.value || 'prod.ol.epicgames.com';
         this.mucDomain = `${xmpp_config.options.muc_name}.${this.domain}`;
 
         this.server = null;
