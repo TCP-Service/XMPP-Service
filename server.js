@@ -51,31 +51,15 @@ app.get('/', (req, res) => {
     res.send('online');
 });
 
-await registerRoutes(app);
+await registerRoutes(app, tcpServer.default.server);
 
-let httpsServer;
-try {
-    const options = {
-        key: fs.readFileSync(path.join(__dirname, rest_config.default.certs.key)),
-        cert: fs.readFileSync(path.join(__dirname, rest_config.default.certs.cert))
-    };
-
-    httpsServer = https.createServer(options, app);
-
-    httpsServer.listen(REST_PORT, () => {
-        logging.rest(`REST API listening on port ${REST_PORT}`);
-    });
-} catch (err) {
-    httpsServer = app.listen(REST_PORT, () => {
-        logging.rest(`REST API listening on port ${REST_PORT}`);
-    });
-}
+app.listen(REST_PORT, () => {
+    logging.rest(`REST API listening on port ${REST_PORT}`);
+});
 
 tcpServer.default.server.start();
 
 if (majorVersion > 16) {
-    // I've changed this so it's easier for ppl to understand and download the right version
-    // and I made it just check the major version (even tho 17 and 18 might still work)
     logging.warn(
         "TLS 1.0 is required for XMPP to function on older seasons (1-3). We recommend using " +
         "\x1b]8;;https://nodejs.org/dist/v16.20.2/node-v16.20.2-x64.msi\x1b\\Node.js v16 or lower.\x1b]8;;\x1b\\"

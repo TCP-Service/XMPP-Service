@@ -48,7 +48,7 @@ class SecureTCPServer {
             }
         } catch (e) {
             logging.warn(
-                "SSL Disabled - Your certificate is expired. Go to " +
+                "SSL Disabled - Your certificate is invalid/expired. Go to " +
                 "\x1b]8;;https://app.zerossl.com/certificate/new\x1b\\ZeroSSL\x1b]8;;\x1b\\ " +
                 "to request a new one."
             );
@@ -198,17 +198,29 @@ class SecureTCPServer {
 
     handleIQ(socket, iq) {
         const id = iq['@_id'];
+        const from = iq['@_from'];
+
+        if (iq.ping && iq.ping['@_xmlns'] === 'urn:xmpp:ping') {
+            socket.write(builder.build({
+                iq: {
+                    '@_type': 'result',
+                    '@_id': id,
+                    ...(from ? { '@_to': from } : {})
+                }
+            }));
+            return;
+        }
 
         if (iq.bind) {
             const resource = iq.bind.resource || crypto.randomUUID();
             socket.fullJid = `${socket.username}@${this.domain}/${resource}`;
             socket.write(builder.build({
-                'iq': {
+                iq: {
                     '@_type': 'result',
                     '@_id': id,
-                    'bind': {
+                    bind: {
                         '@_xmlns': 'urn:ietf:params:xml:ns:xmpp-bind',
-                        'jid': socket.fullJid
+                        jid: socket.fullJid
                     }
                 }
             }));
@@ -216,7 +228,12 @@ class SecureTCPServer {
             return;
         }
 
-        socket.write(builder.build({ 'iq': { '@_type': 'result', '@_id': id } }));
+        socket.write(builder.build({
+            iq: {
+                '@_type': 'result',
+                '@_id': id
+            }
+        }));
     }
 
     handlePresence(socket, presence) {
@@ -229,15 +246,100 @@ class SecureTCPServer {
             return;
         }
 
+        if (presence.status && !to) {
+            try {
+                const statusObj = JSON.parse(presence.status);
+
+                if (Array.isArray(statusObj.Properties)) {
+                    statusObj.Properties = statusObj.Properties.map(prop => {
+                        if (prop.Value && prop.Type === 'String') {
+                            try {
+                                prop.Value = JSON.parse(prop.Value);
+                            } catch {
+                            }
+                        }
+                        return prop;
+                    });
+                }
+
+                const partyProp = statusObj.Properties?.find(
+                    p => p.Name === 'party.joininfodata.286331153'
+                );
+
+                const partyData = partyProp?.Value;
+
+                if (partyData?.partyId) {
+                    const partyRoom = `party-${partyData.partyId.toLowerCase()}@${this.mucDomain}`;
+
+                    const sourceName = partyData.sourceDisplayName;
+                    const baseUsername = socket.username.split(':')[0] || socket.username;
+                    const resource = socket.fullJid.split('/')[1];
+
+                    const nickParts = [];
+                    if (sourceName) nickParts.push(sourceName);
+                    nickParts.push(baseUsername);
+                    nickParts.push(resource);
+
+                    const nick = nickParts.join(':');
+
+                    const userRooms = this.mucMembers.get(socket.fullJid);
+                    const alreadyInParty =
+                        userRooms &&
+                        Array.from(userRooms.keys()).some(room => room.startsWith('party-'));
+
+                    if (!alreadyInParty || !userRooms.has(partyRoom)) {
+                        if (userRooms) {
+                            for (const [room] of userRooms.entries()) {
+                                if (room.startsWith('party-') && room !== partyRoom) {
+                                    this.handleUnavailable(socket, room);
+                                }
+                            }
+                        }
+
+                        if (!this.mucRooms.has(partyRoom)) {
+                            this.mucRooms.set(partyRoom, new Map());
+                        }
+
+                        const occupants = this.mucRooms.get(partyRoom);
+                        occupants.set(socket.fullJid, socket);
+
+                        if (!this.mucMembers.has(socket.fullJid)) {
+                            this.mucMembers.set(socket.fullJid, new Map());
+                        }
+                        this.mucMembers.get(socket.fullJid).set(partyRoom, nick);
+
+                        socket.write(builder.build({
+                            presence: { '@_from': `${partyRoom}/${nick}` }
+                        }));
+
+                        for (const client of occupants.values()) {
+                            if (client !== socket) {
+                                client.write(builder.build({
+                                    presence: { '@_from': `${partyRoom}/${nick}` }
+                                }));
+                            }
+                        }
+                    }
+                }
+            } catch {
+            }
+        }
+
         const xml = builder.build({
-            'presence': {
+            presence: {
                 '@_from': socket.fullJid,
                 ...(presence.show ? { show: presence.show } : {}),
                 ...(presence.status ? (() => {
                     const s = JSON.parse(presence.status);
-                    return { status: JSON.stringify({ ...s, Status: xmpp_config.options.show_version_in_status ? `test ${s.Status || ''}` : s.Status }) };
+                    return {
+                        status: JSON.stringify({
+                            ...s,
+                            Status: xmpp_config.options.show_version_in_status
+                                ? `test ${s.Status || ''}`
+                                : s.Status
+                        })
+                    };
                 })() : {})
-
             }
         });
 
@@ -245,7 +347,11 @@ class SecureTCPServer {
             const parts = to.split('@');
             if (parts.length >= 2) {
                 const toDomain = parts[1].split('/')[0];
-                if (toDomain === this.mucDomain || toDomain.endsWith('.' + this.mucDomain) || this.mucDomain.endsWith('.' + toDomain)) {
+                if (
+                    toDomain === this.mucDomain ||
+                    toDomain.endsWith('.' + this.mucDomain) ||
+                    this.mucDomain.endsWith('.' + toDomain)
+                ) {
                     const room = to.split('/')[0];
                     const nick = to.split('/')[1] || socket.username;
 
@@ -255,6 +361,7 @@ class SecureTCPServer {
                     }
 
                     const occupants = this.mucRooms.get(room);
+                    const wasInRoom = occupants.has(socket.fullJid);
 
                     occupants.set(socket.fullJid, socket);
 
@@ -263,27 +370,24 @@ class SecureTCPServer {
                     }
                     this.mucMembers.get(socket.fullJid).set(room, nick);
 
+                    if (!wasInRoom) {
+                        this.log_debug(`MUC JOIN ${socket.username} -> ${room}`);
+                    }
+
                     socket.write(builder.build({
-                        'presence': { '@_from': `${room}/${nick}` }
+                        presence: { '@_from': `${room}/${nick}` }
                     }));
 
                     for (const client of occupants.values()) {
                         if (client !== socket) {
                             client.write(builder.build({
-                                'presence': {
+                                presence: {
                                     '@_from': `${room}/${nick}`,
                                     ...(presence.show ? { show: presence.show } : {}),
                                     ...(presence.status ? { status: presence.status } : {})
                                 }
                             }));
                         }
-                    }
-
-                    for (const [roomJid, roomOccupants] of this.mucRooms.entries()) {
-                        const occupantList = Array.from(roomOccupants.keys()).map(jid => {
-                            const username = jid.split('@')[0];
-                            return username;
-                        }).join(', ');
                     }
 
                     return;
@@ -408,8 +512,6 @@ class SecureTCPServer {
                         const occupants = this.mucRooms.get(room);
 
                         if (!occupants.has(socket.fullJid)) {
-                            this.log_debug(`MUC AUTO-REJOIN: ${socket.username} -> ${room}`);
-
                             occupants.set(socket.fullJid, socket);
 
                             if (!this.mucMembers.has(socket.fullJid)) {

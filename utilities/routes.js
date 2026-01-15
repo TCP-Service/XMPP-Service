@@ -1,55 +1,34 @@
 import fs from 'fs';
 import path from 'path';
-import { pathToFileURL, fileURLToPath } from 'url';
+import { fileURLToPath, pathToFileURL } from 'url';
+import logging from './log.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-async function routesFromDir(app, dirPath) {
-  try {
-    const entries = fs.readdirSync(dirPath, { withFileTypes: true });
-
-    for (const entry of entries) {
-      const fullPath = path.join(dirPath, entry.name);
-
-      if (entry.isDirectory()) {
-        await routesFromDir(app, fullPath);
-      } else if (
-        entry.isFile() &&
-        (entry.name.endsWith('.js') || entry.name.endsWith('.ts'))
-      ) {
-        try {
-          const fileUrl = pathToFileURL(fullPath);
-          const routeModule = await import(fileUrl.href);
-
-          const route = routeModule.default || routeModule;
-          
-          if (typeof route === 'function') {
-            try {
-              route(app);
-            } catch (configError) {
-              try {
-                app.use(route);
-              } catch (middlewareError) {
-                console.error(`Failed to register route from ${fullPath}:`, {
-                  configError,
-                  middlewareError
-                });
-              }
-            }
-          } else if (route) {
-            app.use(route);
-          }
-        } catch (error) {
-          console.error(`Error importing route from ${fullPath}:`, error);
-        }
-      }
-    }
-  } catch (error) {
-    console.error(`Error registering routes from ${dirPath}:`, error);
-  }
-}
-
 export default async function registerRoutes(app) {
-  await routesFromDir(app, path.join(__dirname, '../rest'));
+    const restDir = path.join(__dirname, '../rest');
+
+    if (!fs.existsSync(restDir)) {
+        logging.warn('REST directory not found');
+        return;
+    }
+
+    const files = fs.readdirSync(restDir);
+
+    for (const file of files) {
+        if (!file.endsWith('.js')) continue;
+
+        const filePath = path.join(restDir, file);
+        const fileUrl = pathToFileURL(filePath).href;
+
+        try {
+            const module = await import(fileUrl);
+            if (typeof module.default === 'function') {
+                module.default(app);
+            }
+        } catch (err) {
+            logging.error(`Failed to load REST module ${file}:`, err);
+        }
+    }
 }
