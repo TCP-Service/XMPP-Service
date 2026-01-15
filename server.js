@@ -1,30 +1,17 @@
 import logging from './utilities/log.js';
-
-import fs from 'fs';
+import { initializeConfigFiles } from './utilities/config.js';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const cfgDir = path.join(__dirname, 'cfg');
-
-const files = ['xmpp_config_template.js', 'rest_config_template.js'];
-
-for (const file of files) {
-    const oldPath = path.join(cfgDir, file);
-    const newPath = path.join(cfgDir, file.replace('_template', ''));
-    if (fs.existsSync(oldPath) && !fs.existsSync(newPath)) {
-        fs.copyFileSync(oldPath, newPath);
-        logging.config(`Created ${path.basename(newPath)}`);
-    }
-}
+await initializeConfigFiles();
 
 const tcpServer = await import(pathToFileURL(path.join(__dirname, 'tcp/index.js')).href);
-const rest_config = await import(pathToFileURL(path.join(cfgDir, 'rest_config.js')).href);
+const rest_config = await import(pathToFileURL(path.join(__dirname, 'cfg/rest_config.js')).href);
 
 import express from 'express';
-import https from 'https';
 import registerRoutes from './utilities/routes.js';
 
 const nodeVersion = process.version;

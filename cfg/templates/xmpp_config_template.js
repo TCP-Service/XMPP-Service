@@ -12,7 +12,7 @@ const xmpp_config = {
         cert: 'cfg/certificate/certificate.crt',
         ca_bundle: 'cfg/certificate/ca_bundle.crt'
     },
-    log_debug: false
+    log_debug: false,
 }
 
 export default xmpp_config;
